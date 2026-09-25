@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+curius - save links and highlights to Curius from the command line.
+
+No browser extension required. Talks directly to the same private API the
+official Curius extension uses (reverse-engineered from the public Firefox
+add-on), authenticating with your Curius JWT.
+
+API contract (base https://curius.app, header Authorization: Bearer <jwt>):
+  GET  /api/user                     -> current user (used by `whoami`)
+  POST /api/links/url  {url}         -> existing saved link for a URL (or empty)
+  POST /api/links      {link:{...}, highlight:{...}|null}  -> create a link
+  POST /api/links/{id}/highlights  {highlight:{...}}       -> add a highlight
+
+Token: put your Curius JWT in ~/.config/curius/token (or env CURIUS_JWT).
+Get it from https://curius.app while logged in:
+  DevTools -> Application -> Local Storage -> https://curius.app -> copy "jwt"
+  (or Cookies -> jwt). It's valid ~1 year.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+BASE = "https://curius.app"
+TOKEN_FILE = os.path.expanduser("~/.config/curius/token")
+
+
+class ApiError(Exception):
+    def __init__(self, status, code, message, raw):
+        super().__init__(message or raw)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.raw = raw
+
+
+def get_token():
+    tok = os.environ.get("CURIUS_JWT")
+    if tok:
+        return tok.strip()
+    try:
+        with open(TOKEN_FILE) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except FileNotFoundError:
+        pass
+    sys.exit(
+        "No Curius token found.\n"
+        f"  Put your JWT in {TOKEN_FILE}  (or set CURIUS_JWT).\n"
+        "  Get it at https://curius.app -> DevTools -> Application ->\n"
+        "  Local Storage -> https://curius.app -> copy the value of 'jwt'."
+    )
+
+
+def api(method, path, body=None):
+    url = BASE + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + get_token())
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        code = message = None
+        try:
+            j = json.loads(detail)
+            code, message = j.get("code"), j.get("error") or j.get("message")
+        except Exception:
+            pass
+        raise ApiError(e.code, code, message, detail)
+    except urllib.error.URLError as e:
+        sys.exit(f"Network error talking to Curius: {e.reason}")
+
+
+def _link_from(res):
+    """Pull a link object (with an id) out of a lenient API response, or None."""
+    if isinstance(res, dict):
+        link = res.get("link", res)
+        if isinstance(link, dict) and link.get("id"):
+            return link
+    return None
+
+
+def find_link(url):
+    """Return the saved-link object for a URL, or None if not saved yet."""
+    return _link_from(api("POST", "/api/links/url", {"url": url}))
+
+
+def save_link(url, title=None, snippet=None):
+    """Create a link, or return the existing one if already saved.
+
+    Mirrors the extension exactly: it POSTs ONLY {link:{link,title,snippet}} —
+    no doc/classify/highlight keys, empty snippet becomes "N/A". Sending extra
+    or null fields makes the server reject with 'A valid link object ...'.
+    """
+    body = {"link": {"link": url, "title": title or url, "snippet": snippet or "N/A"}}
+    try:
+        return _link_from(api("POST", "/api/links", body)), False
+    except ApiError as e:
+        if e.code == "ERR_EXISTS":
+            existing = find_link(url)
+            if existing:
+                return existing, True
+        raise
+
+
+def add_highlight(link_id, text):
+    """POST a highlight onto an existing link."""
+    api("POST", f"/api/links/{link_id}/highlights",
+        {"highlight": {"highlightText": text, "position": 0}})
+
+
+def set_to_read(link_id, value=True):
+    """Mark a link as to-read (or clear it). Mirrors the extension's
+    POST /api/links/{id} {toRead: bool} call."""
+    api("POST", f"/api/links/{link_id}", {"toRead": value})
+
+
+def cmd_whoami(args):
+    user = api("GET", "/api/user")
+    u = user.get("user", user) if isinstance(user, dict) else user
+    if isinstance(u, dict):
+        name = u.get("firstName") or u.get("userName") or ""
+        last = u.get("lastName") or ""
+        uid = u.get("id") or u.get("userId") or "?"
+        print(f"Authenticated as {name} {last} (id {uid})".strip())
+    else:
+        print(json.dumps(user, indent=2))
+
+
+def cmd_save(args):
+    link, existed = save_link(args.url, args.title, args.snippet)
+    lid = link.get("id") if link else "?"
+    print(f"{'Already saved' if existed else 'Saved'}: {args.url}  (link id {lid})")
+    if args.to_read:
+        set_to_read(lid, True)
+        print("  + marked to-read")
+    if args.highlight:
+        add_highlight(lid, args.highlight)
+        print(f'  + highlight: "{args.highlight[:80]}"')
+
+
+def cmd_highlight(args):
+    link, existed = save_link(args.url, args.title, snippet=args.text)
+    lid = link.get("id") if link else "?"
+    add_highlight(lid, args.text)
+    where = "existing" if existed else "new"
+    print(f"Added highlight to {where} link (id {lid}):")
+    print(f'  "{args.text[:120]}"')
+
+
+def main():
+    p = argparse.ArgumentParser(prog="curius", description="Save links/highlights to Curius.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("whoami", help="verify your token / show account")
+    s.set_defaults(func=cmd_whoami)
+
+    s = sub.add_parser("save", help="save a link (optionally with a highlight)")
+    s.add_argument("url")
+    s.add_argument("--title", "-t", help="page title")
+    s.add_argument("--snippet", "-s", help="short description/snippet")
+    s.add_argument("--highlight", "-H", help="highlight text to attach")
+    s.add_argument("--to-read", "-r", action="store_true", help="mark the link as to-read")
+    s.set_defaults(func=cmd_save)
+
+    s = sub.add_parser("highlight", help="save a highlight for a URL (creates the link if needed)")
+    s.add_argument("url")
+    s.add_argument("text", help="the highlighted text")
+    s.add_argument("--title", "-t", help="page title (used only if link is new)")
+    s.set_defaults(func=cmd_highlight)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except ApiError as e:
+        extra = f" ({e.code})" if e.code else ""
+        sys.exit(f"Curius API error HTTP {e.status}{extra}: {e.message or e.raw}")
+
+
+if __name__ == "__main__":
+    main()
